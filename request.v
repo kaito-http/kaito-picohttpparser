@@ -1,7 +1,6 @@
 module picohttpparser
 
 import strconv
-import time
 
 $if !windows {
 	#include <unistd.h>
@@ -149,9 +148,11 @@ pub fn (r &StreamBodyReader) read(mut buf []u8) !int {
 		// Read up to remaining bytes
 		max_read := if remaining > u64(buf.len) { buf.len } else { int(remaining) }
 		mut bytes_read := 0
+		println('Attempting to read ${max_read} bytes, remaining: ${remaining}')
 		unsafe {
 			bytes_read = C.read(reader.fd, &buf[0], usize(max_read))
 		}
+		println('Read returned: ${bytes_read}')
 		if bytes_read <= 0 {
 			if bytes_read == 0 {
 				return error('EOF')
@@ -159,12 +160,16 @@ pub fn (r &StreamBodyReader) read(mut buf []u8) !int {
 			// Check for non-fatal errors like EAGAIN/EWOULDBLOCK
 			$if windows {
 				if C.WSAGetLastError() == C.WSAEWOULDBLOCK {
+					println('Got WSAEWOULDBLOCK')
 					return error('EAGAIN')  // Would block, try again
 				}
+				println('Got WSA error: ${C.WSAGetLastError()}')
 			} $else {
 				if C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK {
+					println('Got EAGAIN/EWOULDBLOCK')
 					return error('EAGAIN')  // Would block, try again
 				}
+				println('Got errno: ${C.errno}')
 			}
 			// Get the actual error number for better diagnostics
 			$if windows {
@@ -175,48 +180,45 @@ pub fn (r &StreamBodyReader) read(mut buf []u8) !int {
 		}
 
 		reader.bytes_read += u64(bytes_read)
+		println('Updated bytes_read to ${reader.bytes_read}')
 		return bytes_read
 	}
 
 	return error('No content length or chunked encoding')
 }
 
+// read_chunk attempts to read a single chunk of data
+pub fn (mut r StreamBodyReader) read_chunk() !([]u8, bool) {
+	mut buf := []u8{len: 1024}
+	n := r.read(mut buf) or {
+		if err.msg() == 'EAGAIN' {
+			// Return empty chunk but indicate more data coming
+			return []u8{}, false
+		}
+		if err.msg() == 'EOF' {
+			// Return empty chunk and indicate we're done
+			return []u8{}, true
+		}
+		return err
+	}
+	// Return the data we got and indicate more might be coming
+	return buf[..n], false
+}
+
+// read_all reads the entire body, but returns partial data on EAGAIN
 pub fn (mut r StreamBodyReader) read_all() ![]u8 {
 	mut total_data := []u8{}
-	mut buf := []u8{len: 1024}
 	
-	// For content-length bodies, read exactly that many bytes
-	if content_length := r.content_length {
-		for r.bytes_read < content_length {
-			println("Reading ${r.bytes_read} of ${content_length}")
-
-			n := r.read(mut buf) or {
-				if err.msg() == 'EAGAIN' {
-					// Socket would block, but we're not done reading
-					// Just continue the loop to try again
-					continue
-				}
-				return err
-			}
-			total_data << buf[..n]
-		}
-		return total_data
-	}
-	
-	// For chunked bodies, read until EOF
 	for {
-		n := r.read(mut buf) or {
-			if err.msg() == 'EOF' {
-				break
-			}
-			if err.msg() == 'EAGAIN' {
-				// Socket would block, but we're not done reading
-				// Just continue the loop to try again
-				continue
-			}
+		chunk, done := r.read_chunk() or {
 			return err
 		}
-		total_data << buf[..n]
+		if chunk.len > 0 {
+			total_data << chunk
+		}
+		if done {
+			break
+		}
 	}
 	
 	return total_data
