@@ -4,6 +4,11 @@ $if !windows {
 	#include <sys/socket.h>
 }
 
+pub interface StreamWriter {
+	write(mut buf []u8) ?int
+	size() ?u64
+}
+
 pub struct Response {
 pub:
 	fd        int
@@ -22,60 +27,11 @@ pub fn (mut r Response) write_string(s string) {
 }
 
 @[inline]
-pub fn (mut r Response) http_ok() &Response {
-	r.write_string('HTTP/1.1 200 OK\r\n')
-	return unsafe { r }
-}
-
-@[inline]
 pub fn (mut r Response) header(k string, v string) &Response {
 	r.write_string(k)
 	r.write_string(': ')
 	r.write_string(v)
 	r.write_string('\r\n')
-	return unsafe { r }
-}
-
-@[inline]
-pub fn (mut r Response) header_date() &Response {
-	r.write_string('Date: ')
-	unsafe {
-		vmemcpy(r.buf, r.date, 29)
-		r.buf += 29
-	}
-	r.write_string('\r\n')
-	return unsafe { r }
-}
-
-@[inline]
-pub fn (mut r Response) header_server() &Response {
-	r.write_string('Server: V\r\n')
-	return unsafe { r }
-}
-
-@[inline]
-pub fn (mut r Response) content_type(s string) &Response {
-	r.write_string('Content-Type: ')
-	r.write_string(s)
-	r.write_string('\r\n')
-	return unsafe { r }
-}
-
-@[inline]
-pub fn (mut r Response) html() &Response {
-	r.write_string('Content-Type: text/html\r\n')
-	return unsafe { r }
-}
-
-@[inline]
-pub fn (mut r Response) plain() &Response {
-	r.write_string('Content-Type: text/plain\r\n')
-	return unsafe { r }
-}
-
-@[inline]
-pub fn (mut r Response) json() &Response {
-	r.write_string('Content-Type: application/json\r\n')
 	return unsafe { r }
 }
 
@@ -90,23 +46,58 @@ pub fn (mut r Response) body(body string) {
 }
 
 @[inline]
-pub fn (mut r Response) http_404() {
-	r.write_string('HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n')
+pub fn (mut r Response) status(status int) {
+	r.write_string('HTTP/1.1 ${status} ${status_text(status)}\r\n')
 }
 
 @[inline]
-pub fn (mut r Response) http_405() {
-	r.write_string('HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n')
-}
+pub fn (mut r Response) body_stream(mut stream StreamWriter) ? {
+	// If stream provides size, we can set Content-Length	
+	if size := stream.size() {
+		r.write_string('Content-Length: ')
+		unsafe {
+			r.buf += u64toa(r.buf, size) or { panic(err) }
+		}
+		r.write_string('\r\n\r\n')
 
-@[inline]
-pub fn (mut r Response) http_500() {
-	r.write_string('HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n')
-}
+		mut buffer := []u8{len: 8192}
+		for {
+			bytes_read := stream.write(mut buffer) or { break }
+			if bytes_read <= 0 {
+				break
+			}
+			unsafe {
+				vmemcpy(r.buf, &buffer[0], bytes_read)
+				r.buf += bytes_read
+			}
+		}
+	} else {
+		// If size is unknown, use chunked transfer encoding
+		r.write_string('Transfer-Encoding: chunked\r\n\r\n')
 
-@[inline]
-pub fn (mut r Response) raw(response string) {
-	r.write_string(response)
+		mut buffer := []u8{len: 8192}
+		for {
+			bytes_read := stream.write(mut buffer) or { break }
+			if bytes_read <= 0 {
+				break
+			}
+
+			// Write chunk size
+			unsafe {
+				chunk_size := u64toa(r.buf, u64(bytes_read)) or { panic(err) }
+				r.buf += chunk_size
+				r.write_string('\r\n')
+
+				// Write chunk data
+				vmemcpy(r.buf, &buffer[0], bytes_read)
+				r.buf += bytes_read
+				r.write_string('\r\n')
+			}
+		}
+
+		// Write final chunk
+		r.write_string('0\r\n\r\n')
+	}
 }
 
 fn C.send(sockfd int, buf voidptr, len usize, flags int) int
