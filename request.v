@@ -1,11 +1,14 @@
 module picohttpparser
 
 import strconv
+import time
 
 $if !windows {
 	#include <unistd.h>
+	#include <errno.h>
 } $else {
 	#include <io.h>
+	#include <winsock2.h>
 }
 
 fn C.read(fd int, buf voidptr, count usize) int
@@ -85,14 +88,20 @@ pub fn (mut r Request) parse_request(s string) !int {
 	return pret.ret
 }
 
+// get_header returns the value of the specified header, or none if not found
+pub fn (r Request) get_header(name string) ?string {
+	lower_name := name.to_lower()
+	for i := 0; i < r.num_headers; i++ {
+		if r.headers[i].name.to_lower() == lower_name {
+			return r.headers[i].value
+		}
+	}
+	return none
+}
+
 // get_body_reader returns the current body reader or creates one if needed
-pub fn (r Request) get_body_reader(fd int) ?&StreamBodyReader {
-	// if r.body_reader != none {
-	// 	return r.body_reader
-	// }
-	reader := r.create_body_reader(fd)?
-	// r.body_reader = reader
-	return reader
+pub fn (r Request) get_body_reader() ?&StreamBodyReader {
+	return r.body_reader
 }
 
 // create_body_reader creates a new StreamBodyReader for the request
@@ -101,13 +110,11 @@ pub fn (r Request) create_body_reader(fd int) ?&StreamBodyReader {
 	mut is_chunked := false
 
 	// Look for Content-Length or Transfer-Encoding headers
-	for i := 0; i < r.num_headers; i++ {
-		if r.headers[i].name.to_lower() == 'content-length' {
-			content_length = r.headers[i].value.u64()
-		} else if r.headers[i].name.to_lower() == 'transfer-encoding' && 
-			r.headers[i].value.to_lower() == 'chunked' {
-			is_chunked = true
-		}
+	if cl := r.get_header('content-length') {
+		content_length = cl.u64()
+	}
+	if te := r.get_header('transfer-encoding') {
+		is_chunked = te.to_lower() == 'chunked'
 	}
 
 	if content_length == none && !is_chunked {
@@ -136,14 +143,35 @@ pub fn (r &StreamBodyReader) read(mut buf []u8) !int {
 	if content_length := reader.content_length {
 		remaining := content_length - reader.bytes_read
 		if remaining == 0 {
-			return -1 // EOF
+			return error('EOF')
 		}
 
 		// Read up to remaining bytes
 		max_read := if remaining > u64(buf.len) { buf.len } else { int(remaining) }
-		bytes_read := unsafe { C.read(reader.fd, &buf[0], max_read) }
+		mut bytes_read := 0
+		unsafe {
+			bytes_read = C.read(reader.fd, &buf[0], usize(max_read))
+		}
 		if bytes_read <= 0 {
-			return error('Socket read error')
+			if bytes_read == 0 {
+				return error('EOF')
+			}
+			// Check for non-fatal errors like EAGAIN/EWOULDBLOCK
+			$if windows {
+				if C.WSAGetLastError() == C.WSAEWOULDBLOCK {
+					return error('EAGAIN')  // Would block, try again
+				}
+			} $else {
+				if C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK {
+					return error('EAGAIN')  // Would block, try again
+				}
+			}
+			// Get the actual error number for better diagnostics
+			$if windows {
+				return error('Socket read error: WSA ${C.WSAGetLastError()}')
+			} $else {
+				return error('Socket read error: ${C.errno}')
+			}
 		}
 
 		reader.bytes_read += u64(bytes_read)
@@ -156,22 +184,48 @@ pub fn (r &StreamBodyReader) read(mut buf []u8) !int {
 pub fn (mut r StreamBodyReader) read_all() ![]u8 {
 	mut total_data := []u8{}
 	mut buf := []u8{len: 1024}
+	
+	// For content-length bodies, read exactly that many bytes
+	if content_length := r.content_length {
+		for r.bytes_read < content_length {
+			println("Reading ${r.bytes_read} of ${content_length}")
+
+			n := r.read(mut buf) or {
+				if err.msg() == 'EAGAIN' {
+					// Socket would block, but we're not done reading
+					// Just continue the loop to try again
+					continue
+				}
+				return err
+			}
+			total_data << buf[..n]
+		}
+		return total_data
+	}
+	
+	// For chunked bodies, read until EOF
 	for {
 		n := r.read(mut buf) or {
-			return error('Failed to read body')
+			if err.msg() == 'EOF' {
+				break
+			}
+			if err.msg() == 'EAGAIN' {
+				// Socket would block, but we're not done reading
+				// Just continue the loop to try again
+				continue
+			}
+			return err
 		}
 		total_data << buf[..n]
-		if n == -1 {
-			break
-		}
 	}
+	
 	return total_data
 }
 
 // read_chunked reads the next chunk of data for chunked transfer encoding
 fn (mut r StreamBodyReader) read_chunked(mut buf []u8) !int {
 	if r.chunk_size == 0 {
-		return -1 // EOF
+		return error('EOF')
 	}
 
 	if r.chunk_size == -1 {
@@ -183,7 +237,10 @@ fn (mut r StreamBodyReader) read_chunked(mut buf []u8) !int {
 		for pos < header.len {
 			n := unsafe { C.read(r.fd, &header[pos], 1) }
 			if n <= 0 {
-				return error('Socket read error')
+				if n == 0 {
+					return error('EOF')
+				}
+				return error('Socket read error 203')
 			}
 			if pos > 0 && header[pos-1] == `\r` && header[pos] == `\n` {
 				break
@@ -201,9 +258,9 @@ fn (mut r StreamBodyReader) read_chunked(mut buf []u8) !int {
 			// Read final CRLF
 			mut crlf := []u8{len: 2}
 			if unsafe { C.read(r.fd, &crlf[0], 2) } != 2 {
-				return error('Socket read error')
+				return error('Socket read error 221')
 			}
-			return -1 // EOF
+			return error('EOF')
 		}
 	}
 
@@ -213,7 +270,10 @@ fn (mut r StreamBodyReader) read_chunked(mut buf []u8) !int {
 	
 	bytes_read := unsafe { C.read(r.fd, &buf[0], max_read) }
 	if bytes_read <= 0 {
-		return error('Socket read error')
+		if bytes_read == 0 {
+			return error('EOF')
+		}
+		return error('Socket read error 236')
 	}
 
 	r.chunk_bytes_read += bytes_read
@@ -221,7 +281,7 @@ fn (mut r StreamBodyReader) read_chunked(mut buf []u8) !int {
 		// Read chunk's trailing CRLF
 		mut crlf := []u8{len: 2}
 		if unsafe { C.read(r.fd, &crlf[0], 2) } != 2 {
-			return error('Socket read error')
+			return error('Socket read error 244')
 		}
 		r.chunk_size = -1 // Ready for next chunk
 	}
