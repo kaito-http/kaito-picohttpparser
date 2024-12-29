@@ -18,12 +18,6 @@ pub mut:
 	value string
 }
 
-// BodyReader provides streaming access to request bodies
-pub interface BodyReader {
-	read(mut buf []u8) !int  // returns -1 for EOF
-	size() ?u64
-	close()
-}
 
 // StreamBodyReader implements BodyReader for streaming request bodies
 pub struct StreamBodyReader {
@@ -40,11 +34,12 @@ pub mut:
 pub struct Request {
 pub mut:
 	prev_len int
-	body_reader ?&BodyReader // Optional body reader for streaming
+	body_reader ?&StreamBodyReader // Optional body reader for streaming
 	method      string
 	path        string
 	headers     [max_headers]Header
 	num_headers int
+	fd          int
 }
 
 // Pret contains the nr of bytes read, a negative number indicates an error
@@ -63,12 +58,14 @@ pub fn (mut r Request) parse_request(s string) !int {
 	buf_end := unsafe { s.str + s.len }
 
 	mut pret := Pret{}
+
 	// if prev_len != 0, check if the request is complete
 	// (a fast countermeasure against slowloris)
 	if r.prev_len != 0 && unsafe { is_complete(buf, buf_end, r.prev_len, mut pret) == nil } {
 		if pret.ret == -1 {
 			return error(pret.err)
 		}
+
 		return pret.ret
 	}
 
@@ -89,17 +86,17 @@ pub fn (mut r Request) parse_request(s string) !int {
 }
 
 // get_body_reader returns the current body reader or creates one if needed
-pub fn (mut r Request) get_body_reader(fd int) ?&BodyReader {
-	if r.body_reader != none {
-		return r.body_reader
-	}
+pub fn (r Request) get_body_reader(fd int) ?&StreamBodyReader {
+	// if r.body_reader != none {
+	// 	return r.body_reader
+	// }
 	reader := r.create_body_reader(fd)?
-	r.body_reader = reader
+	// r.body_reader = reader
 	return reader
 }
 
 // create_body_reader creates a new StreamBodyReader for the request
-pub fn (mut r Request) create_body_reader(fd int) ?&BodyReader {
+pub fn (r Request) create_body_reader(fd int) ?&StreamBodyReader {
 	mut content_length := ?u64(none)
 	mut is_chunked := false
 
@@ -154,6 +151,21 @@ pub fn (r &StreamBodyReader) read(mut buf []u8) !int {
 	}
 
 	return error('No content length or chunked encoding')
+}
+
+pub fn (mut r StreamBodyReader) read_all() ![]u8 {
+	mut total_data := []u8{}
+	mut buf := []u8{len: 1024}
+	for {
+		n := r.read(mut buf) or {
+			return error('Failed to read body')
+		}
+		total_data << buf[..n]
+		if n == -1 {
+			break
+		}
+	}
+	return total_data
 }
 
 // read_chunked reads the next chunk of data for chunked transfer encoding
