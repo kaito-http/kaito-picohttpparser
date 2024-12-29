@@ -205,23 +205,19 @@ pub fn (mut r StreamBodyReader) read_chunk() !([]u8, bool) {
 	return buf[..n], false
 }
 
-// read_all reads the entire body, but returns partial data on EAGAIN
+// read_all reads the entire body, blocking until complete
 pub fn (mut r StreamBodyReader) read_all() ![]u8 {
-	mut total_data := []u8{}
-	
+	mut buf := []u8{}
 	for {
-		chunk, done := r.read_chunk() or {
+		chunk, more := r.read_chunk() or {
 			return err
 		}
-		if chunk.len > 0 {
-			total_data << chunk
-		}
-		if done {
+		buf << chunk
+		if !more {
 			break
 		}
 	}
-	
-	return total_data
+	return buf
 }
 
 // read_chunked reads the next chunk of data for chunked transfer encoding
