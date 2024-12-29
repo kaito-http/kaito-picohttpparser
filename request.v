@@ -18,6 +18,7 @@ pub mut:
 	headers     [max_headers]Header
 	num_headers int
 	body        string
+	body_reader &BodyReader = unsafe { nil }
 }
 
 // get_header returns the value of the specified header
@@ -106,4 +107,21 @@ pub fn (mut r Request) parse_request_path_pipeline(s string) !int {
 		r.prev_len = pret.ret
 	}
 	return pret.ret
+}
+
+// get_body_reader returns the BodyReader if available
+pub fn (r &Request) get_body_reader() ?&BodyReader {
+	if r.body_reader == unsafe { nil } {
+		return none
+	}
+	return r.body_reader
+}
+
+// client_wants_keep_alive returns true if the client wants to keep the connection alive
+pub fn (r &Request) client_wants_keep_alive() bool {
+	if connection := r.get_header('connection') {
+		return connection.to_lower() != 'close'
+	}
+	// Default to keep-alive for HTTP/1.1
+	return true
 }

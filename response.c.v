@@ -28,7 +28,6 @@ pub fn (mut r Response) write_string(s string) {
 
 @[inline]
 pub fn (mut r Response) header(k string, v string) &Response {
-	eprintln('Writing header ${k}: ${v}')
 	r.write_string(k)
 	r.write_string(': ')
 	r.write_string(v)
@@ -38,7 +37,6 @@ pub fn (mut r Response) header(k string, v string) &Response {
 
 @[inline]
 pub fn (mut r Response) body(body string) {
-	eprintln('Writing body of length ${body.len}')
 	// Write Content-Length header
 	r.write_string('Content-Length: ')
 	unsafe {
@@ -49,12 +47,10 @@ pub fn (mut r Response) body(body string) {
 	r.write_string('\r\n')
 	// Write body
 	r.write_string(body)
-	eprintln('Finished writing body')
 }
 
 @[inline]
 pub fn (mut r Response) status(status int) {
-	eprintln('Writing status ${status}')
 	r.write_string('HTTP/1.1 ${status} ${status_text(status)}\r\n')
 	// Add Date header by default
 	if !isnil(r.date) {
@@ -121,33 +117,25 @@ fn C.send(sockfd int, buf voidptr, len usize, flags int) int
 @[inline]
 pub fn (mut r Response) end() int {
 	n := unsafe { r.buf - r.buf_start }
-	eprintln('Attempting to send ${n} bytes')
+
 	if n <= 0 {
-		eprintln('No bytes to send')
 		return 0
 	}
-	
-	// Debug: print the response buffer
-	response_str := unsafe { tos(r.buf_start, n) }
-	eprintln('Response buffer:\n${response_str}')
 	
 	mut total_sent := 0
 	for total_sent < n {
 		sent := C.send(r.fd, unsafe { r.buf_start + total_sent }, n - total_sent, 0)
 		if sent <= 0 {
 			if C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK {
-				eprintln('Would block, retrying...')
 				// Would block, try again after a tiny sleep to prevent CPU spin
 				C.usleep(1000) // 1ms sleep
 				continue
 			}
+
 			// Real error
-			eprintln('send() error: ${C.errno}')
 			return -1
 		}
 		total_sent += sent
-		eprintln('Sent ${sent} bytes, total ${total_sent}/${n}')
 	}
-	eprintln('Successfully sent all ${n} bytes')
 	return total_sent
 }
